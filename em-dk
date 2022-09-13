@@ -1,0 +1,694 @@
+#!/bin/bash
+
+##.###########################################################################.
+##! Copyright (C) Марков Евгений 2022
+##!
+##! \file   em-dk
+##! \author Марков Евгений <mark@gitlab.utis.lan>
+##! \date   2022-08-23 10:51
+##!
+##! \brief  Скрипт позволяет выполнять разные действия (команды), в
+##!         зависимости от того, был ли он запущен один раз или  дважды в
+##!         течении короткого промежутка времени. Например, если скрипт был
+##!         вызван по одиночному или двойному нажатию Shortcat-а.
+##|
+##'###########################################################################'
+
+#double-keystroke
+
+SN=`basename $0`
+
+
+
+##.****************************************************************************.
+##| Lib: em_lib_syslog.sh
+##|
+##'****************************************************************************'
+
+export EM_LIB_SYS_LOG
+
+##.=======================================================================.
+##! \brief Send message to System log.
+##!
+##! \param $1 - message;
+##! \param $2 - name of the logging program;
+##! \param $3 - PID;
+##! \param $4 - enable logging (yes/no/<empty>).
+##!             'yes' or 'no' overrides the value of the 'EM_LIB_SYS_LOG'
+##!             variable
+##|
+##'======================================================================='
+em_lib_logger () {
+
+    local v=
+    local sn=
+    local pid=
+
+    if [ -n "${4}" ];then
+        if [ n${4} = nno ];then return 0
+        elif [ y${4} = yyes ];then v=yes
+        fi
+    fi
+    
+    if [ -z "${v}" ];then
+        if [ y${EM_LIB_SYS_LOG} = yyes ];then v=yes
+        elif [ n${EM_LIB_SYS_LOG} = nno ];then v=no
+        fi
+    fi
+
+    if test -n "${2}";then sn="${2}"
+    elif test -n "${SN}";then sn="${SN}"
+    else sn="NoName"; fi
+
+    if test -n "${3}";then
+        pid="--id ${3}"
+    else
+        pid="--id ${$}"
+    fi
+
+    if [ y${v} = yyes ];then
+        logger -p local2.info -t "${sn}" ${pid} -- "${1}"
+    fi
+}
+export -f em_lib_logger
+
+
+
+##.****************************************************************************.
+##| Lib: em_lib_proc.sh
+##|
+##'****************************************************************************'
+
+##.=======================================================================.
+##! \brief Predicate of the existence of the command (script).
+##!
+##! \param $1      - programm name.
+##! \param $2...$N - аргументы, как у ф-ии em_lib_logger (em_lib_syslog.sh),
+##!                  начиная со второго (первый аргумент ф-ии em_lib_logger
+##!                  пропускается).
+##!
+##! \return  - return code:
+##!                  1 : command not found.
+##|
+##'======================================================================='
+em_lib_proc_cmd_exist_p () {
+
+    local sn=
+
+    if ! type "${1}" > /dev/null 2>&1;then
+
+        shift
+        em_lib_logger "Erorr: object '${1}' not found." "${@}"
+
+        return 1
+    fi
+    return 0
+}
+export -f em_lib_proc_cmd_exist_p
+
+
+
+##.****************************************************************************.
+##| Lib: em_lib_xorg_xinput.sh
+##|
+##'****************************************************************************'
+
+##.=======================================================================.
+##! \brief Получить список индексов устройств клавиатурного ввода.
+##!
+##! \return  - stdout : список индексов (n1 n2 n3 ...)
+##|
+##'======================================================================='
+em_lib_xorg_xinput_get_idxs () {
+
+    local next=
+    local ret=
+    local v=
+
+    xinput --list | \
+        (while IFS= read -r line; do
+             # state machine
+             case "${next}" in
+                 KEYBOARD)
+                     # Virtual core keyboard
+                     case "${line}" in
+                         *"Virtual core pointer"*)
+                             # конец списка устройства клавиатурного ввода
+                             next=
+                             ;;
+                         *)
+                             if [ -n "$(echo "${line}"|grep 'Virtual core XTEST keyboard')" ];then 
+                                 # исключим элемент из списка устройства клавиатурного ввода
+                                 :
+                             else
+                                 # очередной элемент списка устройства клавиатурного ввода
+                                 v=$(echo ${line}|sed 's/^.* id=\([0-9]\+\) .*$/\1/g')
+                                 ret="${ret} ${v}"
+                             fi
+                     esac
+                     ;;
+                 *)
+                     if [ -n "$(echo "${line}"|grep 'Virtual core keyboard')" ];then
+                         # начало списка устройства клавиатурного ввода
+                         next=KEYBOARD
+                     fi
+                     ;;
+             esac
+         done; echo "$ret")
+}
+
+
+##.=======================================================================.
+##! \brief Проверить факт удержания нажатой клавиши клавиатуры.
+##!
+##! \param $1 - количество попыток тестинования состояния клавиш (default 20);
+##! \param $2 - код тестируемой клавиши (использовать 'xev' для определения),
+##!             default - любая клавиша.
+##!
+##! \return  - return code :
+##!                 0 - нет удержания;
+##!                 1 - есть удержание.
+##|
+##'======================================================================='
+em_lib_xorg_keydown_check () {
+    local count=20 # default
+    local key=down # default
+    local r=0
+
+    [ -n "${1}" ] && count=${1}
+    [ -n "${2}" ] && key="key\\[${2}\\]=down"
+
+    # echo "****** count=>${count}<"
+    # echo "****** key=>${key}<"
+
+    while
+        for did in $(em_lib_xorg_xinput_get_idxs)
+        do
+            xinput query-state $did 2>/dev/null | grep "${key}"
+        done | egrep .
+    do
+        r=1
+        sleep 0.1
+        let "count--"
+        [ ${count} = 0 ] && break
+    done
+
+    return ${r}
+}
+
+
+
+##.****************************************************************************.
+##| Lib: em_lib_proc_double_start.sh
+##|
+##'****************************************************************************'
+
+##.=======================================================================.
+##! \brief Получить количество объектов блокировки.
+##!
+##! \param $1 - индивидуальный маркер блокировки;
+##!
+##! \return   - return code :
+##!                 количество объектов блокировки (0,...,N)
+##|
+##'======================================================================='
+em_lib_proc_double_lock_p (){
+
+    local n=$(ps -axo pid,args| \
+                  grep -e "[s]leep [0-9.]\+${1}"| \
+                  sed 's/^ *\([0-9]\+\).*$/\1/'| \
+                  wc -w)
+    return ${n}
+}
+export -f em_lib_proc_double_lock_p
+
+
+
+##.=======================================================================.
+##! \brief Создать объект блокировки.
+##!
+##! \param $1 - индивидуальный маркер блокировки (можно получить, например,
+##!             с помощью:
+##!            cat /dev/urandom | tr -dc '0-9' | fold -w ${1:-16} | head -n 1);
+##! \param $2 - длительность блокировки;
+##|
+##'======================================================================='
+em_lib_proc_double_lock (){
+
+    LANG=C setsid sleep "${2}${1}" &
+}
+export -f em_lib_proc_double_lock
+
+
+
+##.=======================================================================.
+##! \brief Удалить объект блокировки.
+##!
+##! \param $1 - индивидуальный маркер блокировки;
+##|
+##'======================================================================='
+em_lib_proc_double_unlock (){
+
+     local pids=$(ps -axo pid,args| \
+                      grep -e "[s]leep [0-9.]\+${1}"| \
+                      sed 's/^ *\([0-9]\+\).*$/\1/')
+
+    if [ -n "${pids}" ];then
+        while  IFS= read -r p; do
+            kill "${p}"
+        done <<< "${pids}"
+    fi
+}
+export -f em_lib_proc_double_unlock
+
+
+
+##.=======================================================================.
+##! \brief Периодическое тестирование наличие объектов блокировки.
+##!
+##! \param $1 - маркер блокировки;
+##! \param $2 - number;
+##! \param $3 - step;
+##! \param $4 - порог (одновременно существующее количество обектов
+##!             блокировки с одинаковым маркером).
+##!
+##! \return   - return code :
+##!                 0 - есть превышение порога;
+##!                 1 - нет превышение порога.
+##|
+##'======================================================================='
+em_lib_proc_double_test_lock (){
+
+    local n
+
+    for cn in $(seq ${2});do
+
+        em_lib_proc_double_lock_p ${1} # здесь сильно торсозит,
+                                       # можно переписать на C/goland/Rust
+        n=${?}
+        if [ ${n} -gt ${4} ]; then
+            return 0
+        fi
+        LANG=C sleep ${3}
+    done
+    return 1
+}
+export -f em_lib_proc_double_test_lock
+
+
+
+##.=======================================================================.
+##! \brief Основной код (безопасная версия по отношению к eval).
+##!
+##! \param $1 - маркер блокировки;
+##! \param $2 - интервал тестирования повторного запуска скрипта (in sec.);
+##! \param $3 - время жизни объекта сигнализации, созданного при повторном
+##!             запуске скрипта (in sec.);
+##! \param $4 - число попыток тестирования нтервала повторного входа;
+##! \param $5 - шаг тестирования интервала повторного входа (in sec.).
+##!
+##! \return   - return code :
+##!               0 - повторный запуск (установить объект блокировки
+##!                   с интервалом тестирования, затем выйти из скрипта);
+##!               1 - зафиксирован однократный запуск в течении интервала
+##!                   тестирования;
+##!               2 - зафиксирован двойной вход в течении интервала
+##!                   тестирования;
+##!               3 - что-то пошло не так;
+##|
+##'======================================================================='
+em_lib_proc_double_main () {
+
+    local marker=${1}
+    local delay=${2}
+    local delay_next=${3}
+    local number=${4}
+    local step=${5}
+    
+    em_lib_proc_double_lock_p ${marker} 
+
+    case "${?}" in
+        0)  # первый запуск скрипта
+            
+            em_lib_proc_double_lock "${marker}" "${delay}"
+
+            if em_lib_proc_double_test_lock \
+                   "${marker}" "${number}" "${step}" 1;then
+                # зафиксирован двойной вход в течении интервала `delay'
+                return 2
+            else
+                # зафиксирован однократный вход в течении интервала `delay'
+                return 1
+            fi
+            ;;
+
+        1)  # Повторный запуск скрипта в течении интервала тестирования.
+            
+            # Установить объект сигнализации для первичного запуска скрипта.
+            em_lib_proc_double_lock "${marker}" "${delay_next}"    
+            return 0
+            ;;
+
+        *)  # что-то пошло не так.
+            return 3
+            ;;
+    esac
+}
+export -f em_lib_proc_double_main 
+
+
+
+##.****************************************************************************.
+##| Local library
+##|
+##'****************************************************************************'
+
+##.=======================================================================.
+##! \brief Сгенерировать случайное десятичное число.
+##!
+##! \param $1     - случайная строка.
+##!
+##! \return  -  stdout :
+##!                 случайное десятичное число.
+##| 
+##'======================================================================='
+em_fn_proc_rnd_gen () {
+
+    local hsh="0x$(echo "${1}"|sha1sum)"
+    hsh="${hsh:0:15}"
+    printf "%016d" "${hsh}"
+}
+
+
+##.=======================================================================.
+##! \brief Notify for action too fast.
+##|
+##| 
+##'======================================================================='
+em_fn_proc_double_info () {
+    # TODO: заменить на уведомление, а то перехватывает фокус.
+
+    # if em_lib_proc_cmd_exist_p xterm; then
+    #     setsid xterm -g =30x5 -T "${SN}" -e "echo 'Wait, wait...';sleep 3" &
+    # fi
+
+    if em_lib_proc_cmd_exist_p notify-send; then
+        notify-send -t 5000 -u normal -i face-worried -- \
+                    "${SN}" "Wait, wait, wait..."
+    fi
+}
+
+
+
+##.****************************************************************************.
+##| Main section.
+##|
+##'****************************************************************************'
+
+##.=======================================================================.
+##! \brief Information about the arguments.
+##|
+##'======================================================================='
+help_message ()
+{
+    cat << EOF
+Use:
+  ${SN} --help|-h
+
+  ${SN} --rnd 'WORD'
+        [--fg 'COLOR'] [--bg 'COLOR'] [--fnt 'FONT']
+        [--geometry|-g 'GEOM'] 
+        [--daemon1|--d1] [--daemon2|--d2]
+        [--dk-cmd1 'CMD1'] [--ARG11 --ARG12 ...]
+        [--dk-cmd2 'CMD2'] [--ARG21 --ARG22 ...]
+
+Options:
+  --rnd 'WORD'         - random word to generate lock object markers;
+  --geometry,-g 'GEOM' - geometry;
+  --fg 'COLOR'         - foreground color;
+  --bg 'COLOR'         - background color;
+  --fnt 'FONT'         - font;
+  --daemon1|--d1       - start CMD1 in background;
+  --daemon2|--d2       - start CMD2 in background;
+  --dk-cmd1 'CMD1'     - command executed by a single keystroke; 
+  --ARG11 --ARG12 ...  - arguments for CMD1;
+  --dk-cmd2 'CMD2'     - command executed by a single keystroke; 
+  --ARG21 --ARG22 ...  - arguments for CMD2;
+  --help,-h            - this message.
+EOF
+    return 0
+}
+
+
+##.=======================================================================.
+##! \brief Сгенерировать случайное десятичное число.
+##!
+##! \param $1     - a tag;
+##! \param $2     - subcommand to run.
+##! \param $3     - arguments of the command to be run;
+##! \param $4     - geometry of the command window to be run;
+##! \param $5     - foreground color of the command window to be run;
+##! \param $6     - background color of the command window to be run;
+##! \param $7     - font of the command window to be run;
+##! \param $1     - prolog of the command to be run ('setsid -w');
+##! \param $1     - epilog of the command to be run ('> /dev/null 2>&1 &').
+##!
+##! \return  -  stdout :
+##!                 случайное десятичное число.
+##| 
+##'======================================================================='
+em_fn_proc_double_fn () {
+
+    local tg="${1}"
+    local cmd="${2}"
+    local cmd_args="${3}"
+    local geom="-geometry ${4}"
+    local fg="$([ -n "${5}" ] && echo "-fg ${5}")"
+    local bg="$([ -n "${6}" ] && echo "-bg ${6}")"
+    local fnt="$([ -n "${7}" ] && echo "-fn ${7}")"
+    local prolog="${8}"
+    local epilog="${9}"
+
+    EM_TYPE_KEYSTROKE="${tg}"
+
+    if [ -z "${cmd}" ];then
+        tg="-T \"${tg}\""
+        
+        em_lib_logger \
+            "${prolog} xterm ${tg} ${geom} ${fnt} ${fg} ${bg} ${epilog}" \
+            "" "" yes
+
+        eval "${prolog} xterm ${tg} ${geom} ${fnt} ${fg} ${bg} ${epilog}"
+    else
+        em_lib_logger \
+            "${prolog} ${cmd} ${cmd_args} ${epilog}" "" "" yes
+
+        eval "${prolog} ${cmd} ${cmd_args} ${epilog}"
+    fi
+    return 0
+}
+
+
+
+##.~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~.
+##| Оработка довойного/одинатного нажетия клавиши.
+##| В зависимости от типа нажатия, будут вызваны разные браузеры.
+##| 
+##'~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~'
+
+# Тип нежатия клавиши (Single/Double)
+EM_TYPE_KEYSTROKE=Nothing
+
+# управление сообщениями в system log
+EM_LIB_SYS_LOG=yes
+# интервал тестирования повторного запуска скрипта (в секундах).
+EM_DELAY="0.40"
+# время жизни объекта сигнализации, созданного при повторном
+# запуске скрипта (в секундах).
+EM_DELAY_NEXT="0.30"
+# шаг тестирования интервала повторного входа (в секундах).
+EM_STEP="0.1"
+# число попыток тестирования нтервала повторного входа
+EM_NUMBER="5"
+# маркеры для объектов блокировки
+# cat /dev/urandom | tr -dc '0-9' | fold -w ${1:-16} | head -n 1
+EM_MARKER=
+EM_MARKER_BLOCK=
+
+
+EEM_GEOM="=130x50"
+export EEM_GEOM
+EEM_BG=
+export EEM_BG
+EEM_FG=
+export EEM_FG
+EEM_FONT=
+export EEM_FONT
+EEM_TITLE=
+export EEM_TITLE
+
+EM_D_PROLOG1=
+EM_D_EPILOG1=
+EM_CMD1=
+EM_CMD1_ARGS=
+EM_F1=
+
+EM_D_PROLOG2=
+EM_D_EPILOG2=
+EM_CMD2=
+EM_CMD2_ARGS=
+EM_F2=
+
+HELP_MESS=
+
+ERROR_OPTION=
+ERROR_OPTION_LST=
+
+
+if [ "$#" -eq 0 ]; then
+    help_message
+    exit 0
+fi
+
+
+while [ -n "${1}" ];do
+
+    case "${1}" in
+        --dk-cmd1)
+            shift; EM_CMD1="\"${1}\""; EM_F2=; EM_F1=yes;;
+        --dk-cmd2)
+            shift; EM_CMD2="\"${1}\""; EM_F1=; EM_F2=yes;;
+        *)
+            if [ y${EM_F1} = yyes ];then
+                EM_CMD1_ARGS="${EM_CMD1_ARGS} \"${1}\""
+            elif [ y${EM_F2} = yyes ];then
+                EM_CMD2_ARGS="${EM_CMD2_ARGS} \"${1}\""
+            fi
+            ;;&
+        --help|-h)
+            if [ -z "${EM_F1}${EM_F2}" ];then HELP_MESS=yes; fi;;
+        --rnd)
+            if [ -z "${EM_F1}${EM_F2}" ];then
+                shift
+                EM_MARKER=$(em_fn_proc_rnd_gen "${1}marker")
+                EM_MARKER_BLOCK=$(em_fn_proc_rnd_gen "${1}block")
+            fi
+            ;;
+        --geometry|-g)
+            if [ -z "${EM_F1}${EM_F2}" ];then shift; EEM_GEOM="$1"; fi;;
+        --fnt)
+            if [ -z "${EM_F1}${EM_F2}" ];then shift; EEM_FONT="$1"; fi;;
+        --bg)
+            if [ -z "${EM_F1}${EM_F2}" ];then shift; EEM_BG="$1"; fi;;
+        --fg)
+            if [ -z "${EM_F1}${EM_F2}" ];then shift;EEM_FG="$1"; fi;;
+        --daemon1|-d1)
+            if [ -z "${EM_F1}${EM_F2}" ];then
+                EM_D_PROLOG1="setsid -w"
+                EM_D_EPILOG1="> /dev/null 2>&1 &"
+            fi;;
+        --daemon2|-d2)
+            if [ -z "${EM_F1}${EM_F2}" ];then
+                EM_D_PROLOG2="setsid -w"
+                EM_D_EPILOG2="> /dev/null 2>&1 &"
+            fi;;
+        *)
+            if [ -z "${EM_F1}${EM_F2}" ];then
+                ERROR_OPTION=yes;ERROR_OPTION_LST="${ERROR_OPTION_LST} $1"
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ y$HELP_MESS == yyes ]; then help_message; exit 0; fi
+
+if [ -z "${EM_MARKER_BLOCK}" ]||[ -z "${EM_MARKER}" ];then
+    echo -e "\n***Error: need option --rnd.\n"
+    help_message
+    exit 1
+fi
+
+if [ -n "$ERROR_OPTION" ]; then
+    echo -e "\n***Error: ${ERROR_OPTION_LST}: no such options.\n"
+    help_message
+    exit 1
+fi
+
+
+em_lib_proc_double_lock_p ${EM_MARKER_BLOCK}
+if [ ${?} -gt 0 ];then
+    em_fn_proc_double_info
+    sleep 3
+    echo "<=== ${EM_NAME} Stop"
+    exit
+fi
+
+em_lib_proc_double_main \
+    ${EM_MARKER} \
+    ${EM_DELAY}  ${EM_DELAY_NEXT} \
+    ${EM_NUMBER} ${EM_STEP}
+
+
+case "${?}" in
+    0)
+        em_lib_logger "---> Secondory input"
+        exit
+        ;;
+    1)
+        em_lib_logger "---> Single input fixed"
+        em_lib_proc_double_lock ${EM_MARKER_BLOCK} 10.00
+        em_fn_proc_double_fn "single_keystroke" \
+                             "${EM_CMD1}" \
+                             "${EM_CMD1_ARGS}" \
+                             "${EEM_GEOM}" \
+                             "${EEM_FG}" \
+                             "${EEM_BG}" \
+                             "${EEM_FONT}" \
+                             "${EM_D_PROLOG1}" \
+                             "${EM_D_EPILOG1}" 
+        em_lib_proc_double_unlock ${EM_MARKER_BLOCK}
+        ;;
+    2)
+        em_lib_logger "---> Double input fixed"
+        em_lib_proc_double_lock ${EM_MARKER_BLOCK} 10.00
+        em_fn_proc_double_fn "double_keystroke" \
+                             "${EM_CMD2}" \
+                             "${EM_CMD2_ARGS}" \
+                             "${EEM_GEOM}" \
+                             "${EEM_FG}" \
+                             "${EEM_BG}" \
+                             "${EEM_FONT}" \
+                             "${EM_D_PROLOG2}" \
+                             "${EM_D_EPILOG2}" 
+        em_lib_proc_double_unlock ${EM_MARKER_BLOCK}
+        ;;
+    3)
+        em_lib_logger "---> Oho ho ho"
+        em_fn_proc_double_info
+        exit
+        ;;
+esac
+
+em_lib_logger "EM_TYPE_KEYSTROKE=${EM_TYPE_KEYSTROKE}"
+
+if [ "${EM_TYPE_KEYSTROKE}" = Nothing ]; then
+    em_lib_logger "Exit"
+    exit
+fi
+
+
+# em-dk --rnd 'Xhg3gw' -d1 -d2
+
+# em-dk --rnd 'Xhg3gw' -C1 xterm  -g '${EEM_GEOM}' -bg magenta4 -C2 em-dk2k-xterm -d -T "em-xterm-sh" --bg chartreuse4
+
+# em-dk --rnd 'Xhg3gw' -C1 em-dk1k-xterm -d --bg magenta4 -C2 em-dk2k-xterm -d -T "em-xterm-sh" --bg chartreuse4
+
+# em-dk --rnd 'Xhg3gw' -C1 em-dk1k-xterm -d --bg magenta4 -C mc -C2 em-dk2k-xterm -d -T "em-xterm-mc" --bg chartreuse4 -C mc -d
+
+# em-dk --rnd 'Xhg3gw' -C1 em-dk1k-xterm -d --bg magenta4 -C tmux -C2 em-dk2k-xterm -d -T "em-xterm-tmux" --bg chartreuse4 -C tmux
+
+# em-dk --rnd 'Xhg3gw' -C1 em-dk1k-xterm -d --bg magenta4 -C tmux -C2 em-dk2k-xterm -d -T "em-xterm-tmux" --bg chartreuse4 -C "tmux att -t EmXtermTmux || tmux new -s EmXtermTmux"
+
+
+# em-dk --rnd 'XHG3gw' -d1 -d2 & sleep 0.2; em-dk --rnd "XHG3gw" -d1 -d2; sleep 3
