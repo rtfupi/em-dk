@@ -1,0 +1,578 @@
+#!/bin/bash
+
+##.###########################################################################.
+##! Copyright (C) Марков Евгений 2022
+##!
+##! \file   em-dk1k-xtmux-dmenu
+##! \author Марков Евгений <mark@gitlab.utis.lan>
+##! \date   2022-08-30 11:02
+##!
+##! \brief  Скрипт позволяет выполнить запуск команды Tmux в XTerm.
+##!         Геометрия окна может быть настроена с помощью evm-startwin.
+##!         Tmux сессия может быть выбрана с помощью Dmenu.
+##|
+##'###########################################################################'
+
+SN=`basename $0`
+
+
+# logger -p local2.info -t ${SN} "><"
+# em_lib_logger ${SN} "Error: Unknown error."
+
+# echo ">>>>> ${SN}: "
+
+##.=======================================================================.
+##! \brief Information about arguments.
+##|
+##'======================================================================='
+help_message ()
+{
+    cat << EOF
+Use:
+  ${SN} --help|-h
+  ${SN} [--title|-T 'TITLE'] [--fg 'COLOR'] [--bg 'COLOR']
+        [--geometry|-g 'GEOM'] [--fnt 'FONT'] [--daemon|-d]
+        [--swin-arg 'ARG1...'] [--no-swin]
+        [--xterm-cmd|-C 'CMD'] [--ARG1 --ARG2 ...]
+
+Options:
+  --title,-T TITLE     - XTerm title;
+  --geometry,-g 'GEOM' - XTerm geometry;
+  --fg 'COLOR'         - XTerm foreground color;
+  --bg 'COLOR'         - XTerm background color;
+  --fnt 'FONT'         - XTerm font;
+  --daemon|-d          - start xterm-cmd in background;
+  --swin-arg 'ARG1...' - a list arguments of 'e[v]m-startwin';
+  --no-swin            - do not use 'e[v]m-startwin'
+  --help,-h            - this message.
+EOF
+    return 0
+}
+
+
+##.=======================================================================.
+##! \brief Получить текущий workspace.
+##!
+##! \return  - stdout :
+##!                 номер workspace-а (0, 1 ...).
+##!          - return code :
+##!                 1 - не найдена команда wmctrl.
+##|
+##'======================================================================='
+em_lib_xorg_curent_wp () {
+
+    type wmctrl > /dev/null 2>&1 || return 1
+    # wmctrl -d| grep '^[0-9]\+[ \t]\+\*'|cut -d' ' -f1
+    wmctrl -d|sed -n 's/\(^[0-9]\+\)[ \t]\+\*.*/\1/gp'
+    return 0
+}
+export -f em_lib_xorg_curent_wp
+
+
+##.=======================================================================.
+##! \brief Получить список имен терминальных программ (parent) для
+##!        процесса.
+##! 
+##!        Пример: 
+##! 
+##!        10674 ?         xterm -g 130x50+208+37
+##!        10690 pts/0      \_ bash
+##!        10731 pts/0          \_ mc -d
+##!        10733 pts/4              \_ bash -rcfile .bashrc
+##!        10776 pts/4                  \_ tmux
+##!
+##!
+##!        em_lib_proc_search_terminal 10776
+##!        Результат:
+##!          xterm 10674 pts/0 mc 10731 pts/4
+##!
+##! \param $1 - pid of child process;  
+##!
+##! \return - return code :
+##!            0 : terminals list;
+##!                 stdout : list (term_name0 pid0 term_name1 pid1 ...) 
+##!            1 : the process does't have a terminal;
+##!            2 : 'ps' process error;
+##!            3 : it is not parent.
+##|
+##'======================================================================='
+
+em_lib_proc_search_terminal () {
+ 
+    local i="${1}"
+    local t t_old chp ret
+     
+    t_old=$(ps -o tty= -p ${i})
+    [ "${t_old}" == "?" ] && return 1
+    while true; do
+        i=$(ps -o ppid:1= -p ${i})
+        ret="${?}"
+        if [ ${ret} -ne 0 ];then
+            return 2
+        fi
+        [ ${i} -eq 0 ] && return 3
+        t=$(ps -o tty= -p ${i})
+
+        if [ "${t}" != "${t_old}" ];then
+            chp="$(ps -o comm= -p ${i}) ${i} ${t_old} ${chp}"
+            if [ "${t}" == "?" ];then
+                echo "${chp}"|sed 's/^ *//g'
+                return 0
+            fi
+            t_old="${t}"
+        fi
+    done
+    return 3
+}
+export -f em_lib_proc_search_terminal
+
+
+##.=======================================================================.
+##! \brief Получить geometry через e[v]m-startwin.
+##!
+##! \param $1     - geometry;
+##! \param $2     - list other arguments.
+##!
+##! \return  -  stdout :
+##!                 geometry.
+##!          - return code :
+##!                 0 - значение geometry получено успешно;
+##!                 1 - отказ.
+##| 
+##'======================================================================='
+em_fn_proc_startwin () {
+
+    local geom="${1}"
+    local o_args="${2}"
+    
+    if type evm-startwin > /dev/null 2>&1; then
+        geom="$(evm-startwin --geometry "${geom}" ${o_args})"
+        [ -z "${geom}" ] && return 1 
+    fi
+
+    echo "${geom}"
+    return 0
+}
+export -f em_fn_proc_startwin
+
+
+##.=======================================================================.
+##! \brief Wrapper over function 'em_fn_proc_startwin'.
+##!        The exported variable 'EEM_GEOM' is used.
+##!
+##! \param $1     - geometry;
+##! \param $2     - list other arguments.
+##!
+##! \return  -  stdout :
+##!                 geometry.
+##!          - return code :
+##!                 0 - значение geometry получено успешно;
+##!                 1 - отказ.
+##| 
+##'======================================================================='
+em_fn_proc_get_geometry () {
+
+    local geom="${1}"
+    local o_args="${2}"
+
+    [ -z "${geom}" ] && geom="${EEM_GEOM}"
+    [ -z "${geom}" ] && geom="=130x50"
+
+    if [ y${EM_NOSWIN} != yyes ];then
+        geom="$(em_fn_proc_startwin "${geom}" "${o_args}")"
+        [ ${?} -ne 0 ] && return 1
+    fi
+    echo "-geometry \"${geom}\""
+    return 0
+}
+export -f em_fn_proc_get_geometry
+
+
+
+DM_HISTORY=${HOME}/.cache/${SN}
+mkdir -p "${DM_HISTORY}"
+DM_HISTORY=${DM_HISTORY}/history
+
+EM_GEOM=
+HELP_MESS=
+EM_FG=
+EM_BG=
+EM_FONT=
+EM_TITLE=
+
+EM_NOSWIN=
+EM_SWIN_ARGS="--lh 18"
+
+EM_D_PROLOG=
+EM_D_EPILOG=
+
+while [ -n "${1}" ];do
+
+    case "${1}" in
+        --help|-h) HELP_MESS=yes;;
+        --geometry|-g) shift; EM_GEOM="$1";;
+        --fnt) shift; EM_FONT="$1";;
+        --bg) shift; EM_BG="$1";;
+        --fg) shift; EM_FG="$1";;
+        --title|-T) shift; EM_TITLE="$1";;
+        --daemon|-d)
+            EM_D_PROLOG="setsid -w"; EM_D_EPILOG="> /dev/null 2>&1 &";;
+        --no-swin) EM_NOSWIN=yes;;
+        --swin-arg) EM_SWIN_ARGS="${1}";;
+        *)
+            ERROR_OPTION=yes;ERROR_OPTION_LST="${ERROR_OPTION_LST} $1";;
+    esac
+    shift
+done
+
+
+if [ y$HELP_MESS == yyes ]; then help_message; exit 0; fi
+
+if [ -n "$ERROR_OPTION" ]; then
+    echo -e "\n***Error: ${ERROR_OPTION_LST}: no such options.\n"
+    help_message
+    exit 1
+fi
+
+# если не запускать в background c применением 'setsid', то
+# может неправильно определяться  ф-ей 'em_lib_proc_search_terminal'
+# последняя терминальная программа, которая имеет окно на десктопе
+# (например: т.е. если em-dk1k-tmux-dmenu будет запущена из xterm
+# (без ключа -d), то  именно этот xterm (а не xterm, запущенный
+# em-dk1k-tmux-dmenu) будет являться для  tmux терминалом.
+if [ -z "${EM_D_PROLOG}" ] || [ -z "${EM_D_EPILOG}" ]; then
+    echo -e "\n***Warning: --daemon|-d: the absence of this option can lead to `
+                                        `unexpected behavior of the program.\n"
+fi
+
+
+
+[ -z "${EM_FG}" ] && EM_FG="${EEM_FG}"
+[ -n "${EM_FG}" ] && EM_FG="-fg \"${EM_FG}\""
+
+[ -z "${EM_BG}" ] && EM_BG="${EEM_BG}"
+[ -n "${EM_BG}" ] && EM_BG="-bg \"${EM_BG}\""
+
+[ -z "${EM_FONT}" ] && EM_FONT="${EEM_FONT}"
+[ -n "${EM_FONT}" ] && EM_FONT="-fn \"${EM_FONT}\""
+
+[ -n "${EM_TITLE}" ] && EM_TITLE="-T \"${EM_TITLE}\""
+
+
+
+# Найдем все окна xterm, запомним wid окна и pid xterm-а.
+# windos's  wid and pid arrays
+# WID_ARR   - массив WID всех окон. 
+# PID_ARR   - массив PID всех приложений с окнами.
+# DT_ARR    - массив номеров десктопа.
+# TITLE_ARR - массив титлов окон.
+
+N=0
+while  IFS= read -r s; do
+    S1="$(echo "${s}" | `
+               `sed -n "s/^\([xabcdef0-9]\+\)[ \t]\+\([-0-9]\+\)[ \t]\+\([0-9]\+\).*$/\1 \2 \3/gp")"
+
+    eval "S_ARR=(${S1})"
+
+    if [ ${S_ARR[1]} -ge 0 ];then
+        WID_ARR[$N]="${S_ARR[0]}"
+        DT_ARR[$N]="${S_ARR[1]}"
+        PID_ARR[$N]="${S_ARR[2]}"
+        T="$(echo "${s}"|sed -n 's/^\([^ \t]\+[ \t]\+\)\{5\}\(.*\)$/\2/gp'`
+                       `|sed 's/^\(.\{17\}\).*$/\1.../g')"
+        TITLE_ARR[$N]="${T}"
+        # echo "${N} WID_ARR= >${WID_ARR[$N]}< `
+        #           `DT_ARR= >${DT_ARR[$N]}< `
+        #           `PID_ARR= >${PID_ARR[$N]}< `
+        #           `TITLE_ARR[$N]= >${TITLE_ARR[$N]}<"
+        let "N=N+1"
+    fi
+done <<< "$(DISPLAY=:0 wmctrl -lpx)"
+
+# echo -e "\n0---------------------------------------------------------\n"
+# for i in ${!PID_ARR[*]};do
+#     echo -en "${i} WID_ARR=>${WID_ARR[$i]}< `
+#                   `DT_ARR=>${DT_ARR[$i]}< `
+#                   `PID_ARR=>${PID_ARR[$i]}< `
+#                   `TITLE_ARR=>${TITLE_ARR[$i]}\n"
+# done
+# echo -e "\n0---------\n"
+
+
+
+# Запомним wid окон xterm-ов у котрых в потомках есть клиенты tmux
+# ITEM_ARR - массив c данными attached сессий для dmenu.
+# ITEM_WID_ARR - массив wid для attached сессий
+
+# L_CLIENT_ARR[0] - PID клиента (из списка от tmux list-clients)
+# L_CLIENT_ARR[1] - имя сессии клиента  (из списка от tmux list-clients)
+
+EM_CLIENTS_EXISTS="$(tmux list-clients 2>&1)"
+
+if [ ${?} -eq 0 ] && [ -n "${EM_CLIENTS_EXISTS}" ];then
+
+    ITEM_ARR[0]=" 0 new"
+    ITEM_WID_ARR[0]=no
+    ITEM_TERM_PID_ARR[0]=no
+    ITEM_DT_ARR[0]=no
+    ITEM_ATT_ARR[0]=no
+    ITEM_SNAME_ARR[0]=""
+    ITEM_CNAME_ARR[0]=""
+    ITEM_TITLE_ARR[0]=""
+
+    ITEM_ARR[1]=" 1 tmux choose-tree"
+    ITEM_WID_ARR[1]=no
+    ITEM_TERM_PID_ARR[1]=no
+    ITEM_DT_ARR[1]=no
+    ITEM_ATT_ARR[1]=no
+    ITEM_SNAME_ARR[1]=""
+    ITEM_CNAME_ARR[1]=""
+    ITEM_TITLE_ARR[1]=""
+
+    GN=2
+
+    # сервер существует, клиенты существуют
+    while  IFS= read -r l_client; do
+
+        eval "L_CLIENT_ARR=(${l_client})"
+
+        # Найдем терминал (pid, command name) tmux client
+        L_TERM=$(em_lib_proc_search_terminal ${L_CLIENT_ARR[1]}); R=${?}
+        eval "L_TERM=(${L_TERM})"
+
+        ITEM_WID_ARR[${GN}]=no
+        ITEM_DT_ARR[${GN}]=no
+        ITEM_TERM_PID_ARR[${GN}]=no
+        ITEM_TITLE_ARR[${GN}]=""
+        ITEM_SNAME_ARR[${GN}]=${L_CLIENT_ARR[0]}
+        ITEM_CNAME_ARR[${GN}]=${L_CLIENT_ARR[2]}
+        ITEM_ATT_ARR[${GN}]=${L_CLIENT_ARR[3]}
+
+        if [ ${R} -eq 0 ];then
+            # Терминал найден
+            ITEM_TERM_PID_ARR[${GN}]=${L_TERM[1]}
+
+            # Найдем wid окна (если он есть) терминала tmux client
+            for N in ${!PID_ARR[*]}; do
+                if [ ${PID_ARR[$N]} = ${L_TERM[1]} ];then
+                    ITEM_ARR[${GN}]="$(printf "% 2u" ${GN}) `
+                                 `${L_CLIENT_ARR[4]}  `
+                                 `Terminal:(${L_TERM[0]} pid:${L_TERM[1]})  `
+                                 `Desktop:${DT_ARR[${N}]}  `
+                                 `Title: ${TITLE_ARR[${N}]}"
+                    ITEM_WID_ARR[${GN}]=${WID_ARR[${N}]}
+                    ITEM_DT_ARR[${GN}]=${DT_ARR[${N}]}
+                    ITEM_TITLE_ARR[${GN}]=${TITLE_ARR[${N}]}
+                    break
+                fi
+            done
+
+            if [ n${ITEM_DT_ARR[${GN}]} == nno ];then
+                # Терминал attached  tmux client в списке окон не найден
+                ITEM_ARR[${GN}]="$(printf "% 2u" ${GN}) `
+                              `${L_CLIENT_ARR[4]}  `
+                              `Terminal: (${L_TERM[0]} pid:${L_TERM[1]})"
+            else
+                # Сократим массивы открытых окон для ускорения процесса.
+                PID_ARR=("${PID_ARR[@]:0:N}" "${PID_ARR[@]:N+1}")
+                WID_ARR=("${WID_ARR[@]:0:N}" "${WID_ARR[@]:N+1}")
+                DT_ARR=("${DT_ARR[@]:0:N}" "${DT_ARR[@]:N+1}")
+                TITLE_ARR=("${TITLE_ARR[@]:0:N}" "${TITLE_ARR[@]:N+1}")
+            fi
+        fi
+
+        let "GN=GN+1"
+
+    done <<< "$(tmux list-clients`
+                 ` -F "#{client_session} `
+                      `#{client_pid} `
+                      `#{client_name} `
+                      `#{?session_attached,yes,no} `
+                      `\"Session name: #{client_session}   `
+                        `Windows: (cn:#{session_windows}  `
+                                  `sz:#{window_width}x#{window_height})\"")"
+                        # `#{?session_attached,attached,}\"")"
+fi
+
+# echo -e "\n1---------------------------------------------------------\n"
+# for i in ${!ITEM_ARR[*]};do
+#     echo -en "${i} ITEM_WID_ARR=>${ITEM_WID_ARR[$i]}<  `
+#                   `ITEM_DT_ARR=>${ITEM_DT_ARR[$i]}<  `
+#                   `ITEM_ATT_ARR=>${ITEM_ATT_ARR[$i]}<  `
+#                   `ITEM_TERM_PID_ARR=>${ITEM_TERM_PID_ARR[$i]}<  `
+#                   `ITEM_SNAME_ARR=>${ITEM_SNAME_ARR[$i]}<  `
+#                   `ITEM_CNAME_ARR=>${ITEM_CNAME_ARR[$i]}<  `
+#                   `ITEM_TITLE_ARR=>${ITEM_TITLE_ARR[$i]}<\n"
+#     echo -e "      ITEM_ARR=>${ITEM_ARR[$i]}<\n"
+# done
+# echo -e "1---------\n"
+
+
+
+# L_SESS_ARRY[0] - имя сессии (из списка от tmux list-sessions)
+# L_SESS_ARRY[1] - attach признак (из списка от tmux list-clients)
+
+EM_SESSIONS_EXISTS="$(tmux list-sessions 2>&1)"
+
+if [ ${?} -eq 0 ] && [ -n "${EM_SESSIONS_EXISTS}" ];then
+
+    # сервер существует, сессии существуют
+    while  IFS= read -r l_sess; do
+
+        eval "L_SESS_ARR=(${l_sess})"
+
+        if [ ${L_SESS_ARR[0]} -eq 0 ];then
+            ITEM_ARR[${GN}]="$(printf "% 2u" ${GN}) ${L_SESS_ARR[2]}"
+            ITEM_WID_ARR[${GN}]=no
+            ITEM_DT_ARR[${GN}]=no
+            ITEM_ATT_ARR[${GN}]=no
+            ITEM_TERM_PID_ARR[${GN}]=no
+            ITEM_SNAME_ARR[${GN}]=${L_SESS_ARR[1]}
+            ITEM_CNAME_ARR[${GN}]=""
+            ITEM_TITLE_ARR[${GN}]=""
+
+            let "GN=GN+1"
+        fi
+    done <<< "$(tmux list-sessions `
+                `-F "#{?session_attached,1,0} `
+                    `#S `
+                    `\"Session name: #S  `
+                    `Windows: (cn:#{session_windows} `
+                              `sz:#{window_width}x#{window_height})\"")"
+fi
+
+# echo -e "\n2---------------------------------------------------------\n"
+# for i in ${!ITEM_ARR[*]};do
+#     echo -en "${i} ITEM_WID_ARR=>${ITEM_WID_ARR[$i]}<  `
+#                   `ITEM_DT_ARR=>${ITEM_DT_ARR[$i]}<  `
+#                   `ITEM_ATT_ARR=>${ITEM_ATT_ARR[$i]}<  `
+#                   `ITEM_TERM_PID_ARR=>${ITEM_TERM_PID_ARR[$i]}<  `
+#                   `ITEM_SNAME_ARR=>${ITEM_SNAME_ARR[$i]}<  `
+#                   `ITEM_CNAME_ARR=>${ITEM_CNAME_ARR[$i]}<\n"
+#     echo -e "      ITEM_ARR=>${ITEM_ARR[$i]}<\n"
+# done
+# echo -e "ITEM_TITLE_ARR=>${ITEM_TITLE_ARR[$i]}<\n"
+# echo -e "\n2---------\n"
+
+
+
+# echo -e "3---------------------------------------------------------\n"
+
+EM_MACROS_GET_GEOMETRY () {
+    EM_GEOM="$(em_fn_proc_get_geometry "${EM_GEOM}" "EM_SWIN_ARGS" )"
+    [ ${?} -ne 0 ] && exit
+}
+
+
+if type dmenu > /dev/null 2>&1;then 
+
+    # Заполним history файл
+    echo -n > "${DM_HISTORY}"
+    for i in ${!ITEM_ARR[*]}; do
+        echo "${ITEM_ARR[${i}]}" >> "${DM_HISTORY}"
+    done
+
+    SARGS=$(DISPLAY=:0 dmenu \
+                   -l 20 \
+                   -y 450 \
+                   -x 200 \
+                   -z 1200 \
+                   -nb '#ffdab9' \
+                   -nf '#000000' \
+                   -fn "-xos4-terminus-medium-r-*-*-16-*" < "${DM_HISTORY}")
+
+    case "${SARGS}" in
+        " 0 new")
+            
+            EM_MACROS_GET_GEOMETRY
+            eval "${EM_D_PROLOG} `
+                        `xterm ${EM_GEOM} ${EM_TITLE} `
+                              `${EM_FONT} ${EM_FG} ${EM_BG} `
+                              `-e tmux `
+                 `${EM_D_EPILOG}"
+            exit 0
+            ;;
+        " 1 tmux choose-tree")
+
+            EM_MACROS_GET_GEOMETRY
+            eval "${EM_D_PROLOG} `
+                   `xterm `
+                     `${EM_GEOM} ${EM_TITLE} `
+                     `${EM_FONT} ${EM_FG} ${EM_BG} `
+                     `-e \"tmux att -t 'ChooseTree' || `
+                        `tmux new-session -s ChooseTree -n choose-tree \; `
+                        `choose-tree -Zs 'switch-client -t %% ; `
+                                         `kill-session -t ChooseTree' \; `
+                        `new-window -n choose-client \; `
+                        `choose-client -Z \; `
+                        `select-window -t:0\" `
+                 `${EM_D_EPILOG}"
+
+            exit 0
+            ;;
+        *" Session name: "*" Windows: "*)
+            
+            IDX="$(echo "${SARGS}" | `
+                 `sed -n `
+                  `'s/^[ \t]*\([0-9]\+\)[ \t]\+Session name:.*\(.\)$/"\1" "\2"/gp')"
+
+            if [ -n "${IDX}" ];then
+                eval "IDX_ARR=(${IDX})"
+                I=${IDX_ARR[0]}
+
+                if [ n${IDX_ARR[1]} == n- ];then
+
+                    if [ n${ITEM_ATT_ARR[${I}]} = nno ];then
+
+                        tmux kill-session -t "${ITEM_SNAME_ARR[${I}]}"
+                    else
+
+                        tmux detach-client -P -t "${ITEM_CNAME_ARR[${I}]}"
+                    fi
+                else
+                    
+                    if [ n${ITEM_ATT_ARR[${I}]} = nno ];then
+
+                        EM_MACROS_GET_GEOMETRY
+                         eval "${EM_D_PROLOG} `
+                                    `xterm ${EM_GEOM} ${EM_TITLE} `
+                                          `${EM_FONT} ${EM_FG} ${EM_BG} `
+                                          `-e tmux attach-session `
+                                               `-t '${ITEM_SNAME_ARR[${I}]}' `
+                              `${EM_D_EPILOG}"
+
+                    elif [ n${ITEM_WID_ARR[${I}]} != nno ];then
+
+                        wmctrl -i -t $(em_lib_xorg_curent_wp) \
+                               -R "${ITEM_WID_ARR[${I}]}"
+                    else
+                        
+                        EM_MACROS_GET_GEOMETRY
+                        eval "${EM_D_PROLOG} `
+                                   `xterm `
+                                      `${EM_GEOM} ${EM_TITLE} `
+                                      `${EM_FONT} ${EM_FG} ${EM_BG} `
+                                      `-e tmux `
+                                              `attach-session `
+                                                `-t '${ITEM_SNAME_ARR[${I}]}' `
+                             `${EM_D_EPILOG}"
+                    fi
+                fi
+            fi
+              
+            exit 0
+            ;;
+    esac
+else
+    EM_MACROS_GET_GEOMETRY
+    eval "${EM_D_PROLOG} `
+                `xterm ${EM_GEOM} ${EM_TITLE} `
+                      `${EM_FONT} ${EM_FG} ${EM_BG} `
+                      `-e tmux `
+         `${EM_D_EPILOG}"
+fi
+
+exit 
+
+
+# em-dk1k-xterm --bg chartreuse4 --fg gren -g 100x30 -T "456 789" -r "^456 789\$" -C mc -d

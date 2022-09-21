@@ -1,0 +1,207 @@
+#!/bin/bash
+
+##.###########################################################################.
+##! Copyright (C) Марков Евгений 2022
+##!
+##! \file   em-dk1k-xterm
+##! \author Марков Евгений <mark@gitlab.utis.lan>
+##! \date   2022-08-23 10:51
+##!
+##! \brief  Скрипт позволяет выполнить запуск команды в XTerm.
+##!         Геометрия окна может быть настроена с помощью evm-startwin.
+##|
+##'###########################################################################'
+
+#double-keystroke
+
+SN=`basename $0`
+
+#logger -p local2.info -t ${SN} "><"
+
+L_DEBUG=yes
+
+em_lib_logger "====>" "" "" ${L_DEBUG}
+
+
+##.=======================================================================.
+##! \brief Information about arguments.
+##|
+##'======================================================================='
+help_message ()
+{
+    cat << EOF
+Use:
+  ${SN} --help|-h
+  ${SN} [--title|-T 'TITLE'] [--fg 'COLOR'] [--bg 'COLOR']
+        [--geometry|-g 'GEOM'] [--fnt 'FONT'] [--daemon|-d]
+        [--swin-arg 'ARG1...'] [--no-swin]
+        [--cmd|-C 'CMD'] [--ARG1 --ARG2 ...]
+
+Options:
+  --title,-T TITLE     - XTerm title;
+  --geometry,-g 'GEOM' - XTerm geometry;
+  --fg 'COLOR'         - XTerm foreground color;
+  --bg 'COLOR'         - XTerm background color;
+  --fnt 'FONT'         - XTerm font;
+  --daemon|-d          - start xterm-cmd in background;
+  --swin-arg 'ARG1...' - a list arguments of 'e[v]m-startwin';
+  --no-swin            - do not use 'e[v]m-startwin'
+  --cmd,-C 'CMD'       - command running in XTerm;
+  --ARG1 --ARG2 ...    - arguments for CMD;
+  --help,-h            - this message.
+EOF
+    return 0
+}
+
+
+
+##.=======================================================================.
+##! \brief Получить geometry через e[v]m-startwin.
+##!
+##! \param $1     - geometry;
+##! \param $2     - list other arguments.
+##!
+##! \return  -  stdout :
+##!                 geometry.
+##!          - return code :
+##!                 0 - значение geometry получено успешно;
+##!                 1 - отказ.
+##| 
+##'======================================================================='
+em_fn_proc_startwin () {
+
+    local geom="${1}"
+    local o_args="${2}"
+
+    if type evm-startwin > /dev/null 2>&1; then
+        geom="$(evm-startwin --geometry "${geom}" ${o_args})"
+        [ -z "${geom}" ] && return 1 
+    fi
+
+    echo "${geom}"
+    return 0
+}
+export -f em_fn_proc_startwin
+
+
+em_exit () {
+    
+    local msg="Exit ${1} Line: ${LINENO}"
+    [ -n "${2}" ] && msg="${2}"
+    
+    em_lib_logger "${msg}" "" "" ${L_DEBUG}
+
+    exit ${1}
+}
+
+
+
+HELP_MESS=
+EM_GEOM=
+EM_FG=
+EM_BG=
+EM_FONT=
+EM_TITLE=
+
+EM_NOSWIN=
+EM_SWIN_ARGS="--lh 18"
+
+EM_CMD=
+EM_CMD_ARGS=
+EM_D_PROLOG=
+EM_D_EPILOG=
+
+while [ -n "${1}" ];do
+
+    case "${1}" in
+        --cmd|-C)
+            if [ -z "${EM_F}" ];then
+                shift
+                EM_CMD="\"${1}\""
+                EM_F=yes
+                shift
+                continue
+            fi
+            ;;&
+        *)
+            if [ y${EM_F} = yyes ];then
+                EM_CMD_ARGS="${EM_CMD_ARGS} \"${1}\""
+            fi
+            ;;&
+        --help|-h)
+            if [ -z "${EM_F}" ];then HELP_MESS=yes;fi;;
+        --geometry|-g)
+            if [ -z "${EM_F}" ];then shift; EM_GEOM="$1"; fi;;
+        --fnt)
+            if [ -z "${EM_F}" ];then shift; EM_FONT="$1"; fi;;
+        --bg)
+            if [ -z "${EM_F}" ];then shift; EM_BG="$1"; fi;;
+        --fg)
+            if [ -z "${EM_F}" ];then shift; EM_FG="$1"; fi;;
+        --title|-T)
+            if [ -z "${EM_F}" ];then shift; EM_TITLE="$1"; fi;;
+        --daemon|-d)
+            if [ -z "${EM_F}" ];then
+                EM_D_PROLOG="setsid -w"
+                EM_D_EPILOG="> /dev/null 2>&1 &"
+            fi;;
+        --no-swin)
+            if [ -z "${EM_F}" ];then EM_NOSWIN=yes; fi;;
+        --swin-arg)
+            if [ -z "${EM_F}" ];then shift;EM_SWIN_ARGS="${1}"; fi;;
+        *)
+            if [ -z "${EM_F}" ];then
+                ERROR_OPTION=yes;ERROR_OPTION_LST="${ERROR_OPTION_LST} $1"
+            fi
+            ;;
+    esac
+    shift
+done
+
+
+if [ y$HELP_MESS == yyes ]; then help_message; exit 0; fi
+
+if [ ! -z "$ERROR_OPTION" ]; then
+    MSG="***Error: ${ERROR_OPTION_LST}: no such options."
+    echo -e "\n${MSG}\n"
+    help_message
+    em_exit 1 "Exit 1. ${MSG}."
+fi
+
+
+[ -z "${EM_GEOM}" ] && EM_GEOM="${EEM_GEOM}"
+[ -z "${EM_GEOM}" ] && EM_GEOM="=130x50"
+if [ y${EM_NOSWIN} != yyes ];then
+    EM_GEOM="$(em_fn_proc_startwin "${EM_GEOM}" "${EM_SWIN_ARGS}")"
+    [ ${?} -ne 0 ] && em_exit 0
+fi
+EM_GEOM="-geometry ${EM_GEOM}"
+
+[ -z "${EM_FG}" ] && EM_FG="${EEM_FG}"
+[ -n "${EM_FG}" ] && EM_FG="-fg \"${EM_FG}\""
+
+[ -z "${EM_BG}" ] && EM_BG="${EEM_BG}"
+[ -n "${EM_BG}" ] && EM_BG="-bg \"${EM_BG}\""
+
+[ -z "${EM_FONT}" ] && EM_FONT="${EEM_FONT}"
+[ -n "${EM_FONT}" ] && EM_FONT="-fn \"${EM_FONT}\""
+
+[ -n "${EM_TITLE}" ] && EM_TITLE="-T \"${EM_TITLE}\""
+
+[ -n "${EM_CMD}" ] && EM_CMD="-e ${EM_CMD}"
+
+
+em_lib_logger \
+    "${EM_D_PROLOG} xterm ${EM_GEOM} ${EM_FONT} ${EM_FG} ${EM_BG} `
+                          `${EM_TITLE} ${EM_CMD} ${EM_CMD_ARGS} `
+                          `${EM_D_EPILOG}" "" "" ${L_DEBUG}
+
+
+eval "${EM_D_PROLOG} xterm ${EM_GEOM} ${EM_FONT} ${EM_FG} ${EM_BG} `
+                           `${EM_TITLE} ${EM_CMD} ${EM_CMD_ARGS} `
+                           `${EM_D_EPILOG}"
+
+em_lib_logger "Out <==="  "" "" ${L_DEBUG}
+
+
+# em-dk1k-xterm --bg chartreuse4 --fg gren -g 100x30 -T "456 789" -r "^456 789\$" -C mc -d

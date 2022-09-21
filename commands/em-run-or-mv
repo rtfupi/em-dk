@@ -1,0 +1,321 @@
+#!/bin/bash
+
+##.###########################################################################.
+##! Copyright (C) Марков Евгений 2022
+##!
+##! \file   em-dk2k-xterm
+##! \author Марков Евгений <mark@gitlab.utis.lan>
+##! \date   2022-09-01 23:30
+##!
+##! \brief  Скрипт позволяет выполнить перенос окна программы, если
+##!         программа уже запущена, на текущий десктоп, и если программа
+##!         не запущена, то запустить натекущем десктопе.
+##|
+##'###########################################################################'
+
+# double-keystroke
+
+SN=`basename $0`
+
+L_DEBUG=yes
+
+#logger -p local2.info -t ${SN} "><"
+
+
+##.****************************************************************************.
+##| Lib: em_lib_syslog.sh
+##|
+##'****************************************************************************'
+
+export EM_LIB_SYS_LOG
+
+##.=======================================================================.
+##! \brief Send message to System log.
+##!
+##! \param $1 - message;
+##! \param $2 - tag;
+##! \param $3 - PID;
+##! \param $4 - enable logging (yes/no/<empty>).
+##!             'yes' or 'no' overrides the value of the 'EM_LIB_SYS_LOG'
+##!             variable
+##|
+##'======================================================================='
+em_lib_logger () {
+
+    local v tag pid
+
+    if [ n${4} = nno ];then return 0
+    elif [ y${4} = yyes ];then v=yes; fi
+
+    if [ -z "${v}" ];then
+        v=no; [ y${EM_LIB_SYS_LOG} = yyes ] && v=yes
+    fi
+
+    if [ -n "${2}" ];then tag="-t ${2}"
+    elif [ -n "${SN}" ];then tag="-t ${SN}"
+    fi
+
+    pid="--id ${$}";[ -n "${3}" ] && pid="--id ${3}"
+
+    if [ y${v} = yyes ];then
+        logger -p local2.info ${tag} ${pid} -- "${1}"
+    fi
+}
+export -f em_lib_logger
+
+
+
+##.****************************************************************************.
+##| Lib: em_lib_xorg_wmctrl.sh
+##|
+##'****************************************************************************'
+
+##.=======================================================================.
+##! \brief Предикат существования окна.
+##!
+##! \param $1 - window title (regexp для grep).
+##!
+##! \return  - stdout :
+##!                 WID.
+##!          - return code :
+##!                 0 - Ok;
+##!                 1 - не найдена команда wmctrl;
+##!                 2 - не такого окна.
+##|
+##'======================================================================='
+em_lib_xorg_exist_p () {
+
+    local wid
+
+    type wmctrl > /dev/null 2>&1 || return 1
+    wid="$(wmctrl -l|sed -n "s/^\([0-9xabcdef]\+[ \t]\+\)`
+                               `\([^ \t]\+[ \t]\+\)\{2\}`
+                               `\($1\)\$/\1/gp")"
+    [ -z "${wid}" ] && return 2
+    echo "${wid}"
+    return 0
+}
+export -f em_lib_xorg_exist_p
+
+
+##.=======================================================================.
+##! \brief Получить текущий workspace.
+##!
+##! \return  - stdout :
+##!                 номер workspace-а (0, 1 ...).
+##!          - return code :
+##!                 1 - не найдена команда wmctrl.
+##|
+##'======================================================================='
+em_lib_xorg_curent_wp () {
+
+    type wmctrl > /dev/null 2>&1 || return 1
+    wmctrl -d|sed -n 's/^\([0-9]\+\)[ \t]\+\*.*/\1/gp'
+    return 0
+}
+export -f em_lib_xorg_curent_wp
+
+
+##.=======================================================================.
+##! \brief Переместить окно в текущий workspace.
+##!
+##! \param $1 - window title (regexp для grep).
+##!
+##! \return  - stdout :
+##!                 номер workspace-а (0, 1 ...).
+##!          - return code :
+##!                 1 - не найдена команда wmctrl;
+##!                 2 - не такого окна.
+##|
+##'======================================================================='
+em_lib_xorg_mv_to_curent_wp () {
+
+    local wid rv
+
+    wid="$(em_lib_xorg_exist_p "${1}")"; rv=${?}
+    [ ${rv} != 0 ] && return ${rv}
+    echo "wmctrl -i -t $(em_lib_xorg_curent_wp) -R \"${wid}\""
+    wmctrl -i -t $(em_lib_xorg_curent_wp) -R "${wid}"
+    return 0
+}
+export -f em_lib_xorg_mv_to_curent_wp
+
+
+##.****************************************************************************.
+##| Local library
+##|
+##'****************************************************************************'
+
+##.=======================================================================.
+##! \brief Information about arguments.
+##|
+##'======================================================================='
+help_message ()
+{
+    cat << EOF
+Use:
+  ${SN} --help|-h
+  ${SN} --regexp,-r 'REGEXP' [--geom-opt|-G 'OPT'] 
+        [--daemon|-d] [--swin-arg 'ARG1...'] [--no-swin]
+        [--cmd|-C 'CMD'] [ARG1 ARG2 ...]
+
+Options:
+  --regexp,-r 'REGEXP' - regexp for title search;
+  --daemon|-d          - start xterm-cmd in background;
+  --no-swin            - do not use 'em-startwin'
+  --swin-arg 'ARG1...' - a list arguments of 'evm-startwin';
+  --geometry,-g 'GEOM' - geometry of command to run;
+  --geom-opt,-G 'OPT'  - geometry option (name option) of command to run;
+  --cmd,-C 'CMD'       - command to run;
+    ARG1 ARG2 ...      - arguments for CMD;
+  --help,-h            - this message.
+EOF
+    return 0
+}
+
+
+
+##.=======================================================================.
+##! \brief Получить geometry через e[v]m-startwin.
+##!
+##! \param $1     - geometry;
+##! \param $2     - list other arguments.
+##!
+##! \return  -  stdout :
+##!                 geometry.
+##!          - return code :
+##!                 0 - значение geometry получено успешно;
+##!                 1 - отказ.
+##|
+##'======================================================================='
+em_fn_proc_startwin () {
+
+    local geom="${1}"
+    local o_args="${2}"
+
+    if type evm-startwin > /dev/null 2>&1; then
+        geom="$(evm-startwin --geometry "${geom}" ${o_args})"
+        [ -z "${geom}" ] && return 1 
+    fi
+
+    echo "${geom}"
+    return 0
+}
+export -f em_fn_proc_startwin
+
+
+HELP_MESS=
+EM_GEOM="=130x50"
+EM_GEOM_OPT=
+EM_REGEXP=
+
+EM_NOSWIN=
+EM_SWIN_ARGS="--lh 18"
+
+EM_CMD=
+EM_CMD_ARGS=
+EM_F=
+EM_D_PROLOG=
+EM_D_EPILOG=
+
+
+
+while [ -n "${1}" ];do
+    case "${1}" in
+        --cmd|-C)
+            if [ -z "${EM_F}" ];then
+                shift
+                EM_CMD="\"${1}\""
+                EM_F=yes
+                shift
+                continue
+            fi
+            ;;&
+        *)
+            if [ y${EM_F} = yyes ];then
+                EM_CMD_ARGS="${EM_CMD_ARGS} \"${1}\""
+            fi
+            ;;&
+        --help|-h)
+            if [ -z "${EM_F}" ];then HELP_MESS=yes;fi;;
+        --geometry|-g)
+            if [ -z "${EM_F}" ];then shift; EM_GEOM="$1"; fi;;
+        --geom-opt|-G)
+            if [ -z "${EM_F}" ];then shift; EM_GEOM_OPT="$1"; fi;;
+        --regexp|-r)
+            if [ -z "${EM_F}" ];then shift; EM_REGEXP="$1"; fi;;
+        --daemon|-d)
+            if [ -z "${EM_F}" ];then
+                EM_D_PROLOG="setsid -w"
+                EM_D_EPILOG="> /dev/null 2>&1 &"
+            fi;;
+        --swin-arg)
+            if [ -z "${EM_F}" ];then shift;EM_SWIN_ARGS="${1}"; fi;;
+        --no-swin)
+            if [ -z "${EM_F}" ];then EM_NOSWIN=yes;fi;;
+        *)
+            if [ -z "${EM_F}" ];then
+                ERROR_OPTION=yes;ERROR_OPTION_LST="${ERROR_OPTION_LST} $1"
+            fi
+            ;;
+    esac
+    shift
+done
+
+
+if [ y$HELP_MESS == yyes ]; then help_message; exit 0; fi
+
+if [ -z "${EM_REGEXP}" ];then
+    echo -e "\n***Error: need option --regexp|-r.\n"
+    help_message
+    exit 1
+fi
+
+
+if [ -z "${EM_CMD}" ];then
+    echo -e "\n***Error: need option --cmd|-C.\n"
+    help_message
+    exit 1
+fi
+
+
+if [ -z "${EM_REGEXP}" ];then
+    echo -e "\n***Error: need option --regexp|-r.\n"
+    help_message
+    exit 1
+fi
+
+if [ ! -z "$ERROR_OPTION" ]; then
+    echo
+    echo "***Error: ${ERROR_OPTION_LST}: no such options."
+    echo
+    help_message
+    exit 1
+fi
+
+if em_lib_xorg_exist_p "${EM_REGEXP}"; then
+    # переместить окно целевой программы на текущий десктоп,
+    # поднять наверх, установить фокус.
+    em_lib_xorg_mv_to_curent_wp "${EM_REGEXP}"
+else
+    # запустить целевой xterm.
+
+    # geometry
+    if [ -n "${EM_GEOM_OPT}" ];then
+        if [ y${EM_NOSWIN} != yyes ];then
+            EM_GEOM="$(em_fn_proc_startwin "${EM_GEOM}" "${EM_SWIN_ARGS}")"
+            [ ${?} -ne 0 ] && exit
+        fi
+        EM_GEOM_OPT="${EM_GEOM_OPT}${EM_GEOM}"
+    fi
+
+    em_lib_logger \
+        "${EM_D_PROLOG} ${EM_CMD} ${EM_GEOM_OPT} ${EM_CMD_ARGS} `
+                                  `${EM_D_EPILOG} "" "" ${L_DEBUG}"
+
+    eval \
+        "${EM_D_PROLOG} ${EM_CMD} ${EM_GEOM_OPT} ${EM_CMD_ARGS} `
+                                 `${EM_D_EPILOG}"
+fi
+
+# em-2cdp --regexp aaa --daemon -cmd 
